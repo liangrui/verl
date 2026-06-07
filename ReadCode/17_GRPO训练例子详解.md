@@ -362,17 +362,17 @@ data.train_files=[./data/my_math_train.parquet]
 
 ```mermaid
 sequenceDiagram
-    participant 你 as 新手
-    participant 脚本 as run_qwen3_8b_fsdp.sh
-    participant Ray as Ray 训练器
-    participant Rollout as Rollout 工作器
-    participant Actor as Actor 训练器
+    participant You as "新手"
+    participant Script as "run_qwen3_8b_fsdp.sh"
+    participant Ray as "Ray 训练器"
+    participant Rollout as "Rollout 工作器"
+    participant Actor as "Actor 训练器"
 
-    你->>脚本: bash run_qwen3_8b_fsdp.sh
-    脚本->>Ray: 启动训练
+    You->>Script: bash run_qwen3_8b_fsdp.sh
+    Script->>Ray: 启动训练
     loop 每一轮
         Ray->>Rollout: 生成答案
-        Rollout-->>Ray: 返回 4 个答案/问题
+        Rollout-->>Ray: 返回4个答案/问题
         Ray->>Ray: 计算奖励
         Ray->>Actor: 更新模型
         Actor-->>Ray: 更新完成
@@ -540,25 +540,25 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant DL as DataLoader
-    participant Driver as RayPPOTrainer<br/>(Driver)
-    participant Rollout as vLLM Rollout<br/>(GPU 0,1)
-    participant Reward as NaiveRewardManager
-    participant Actor as Actor Worker<br/>(GPU 0-3, FSDP2)
-    participant Ref as Ref Worker<br/>(GPU 0-3, FSDP2)
-    participant Ckpt as CheckpointManager
+    participant DL as "DataLoader"
+    participant Driver as "RayPPOTrainer (Driver)"
+    participant Rollout as "vLLM Rollout (GPU 0,1)"
+    participant Reward as "NaiveRewardManager"
+    participant Actor as "Actor Worker (GPU 0-3, FSDP2)"
+    participant Ref as "Ref Worker (GPU 0-3, FSDP2)"
+    participant Ckpt as "CheckpointManager"
 
-    DL->>Driver: 采样 1024 条 prompt
-    Driver->>Driver: 分配 uuid, repeat(n=5)<br/>得到 5120 条数据
+    DL->>Driver: 采样1024条prompt
+    Driver->>Driver: 分配uuid, repeat(n=5) 得到5120条数据
 
-    Note over Driver,Rollout: 阶段1: Rollout 生成
+    Note over Driver,Rollout: 阶段1: Rollout生成
     Driver->>Rollout: generate_sequences(5120条)
-    Rollout-->>Driver: 返回 responses + input_ids
+    Rollout-->>Driver: 返回responses + input_ids
     Driver->>Ckpt: sleep_replicas() 释放Rollout显存
 
     Note over Driver,Reward: 阶段2: 奖励计算
     Driver->>Reward: compute_score(data_source, solution, ground_truth)
-    Reward->>Reward: data_source="openai/gsm8k"<br/>→ gsm8k.extract_solution<br/>→ gsm8k.compute_score
+    Reward->>Reward: data_source=openai/gsm8k - extract_solution - compute_score
     Reward-->>Driver: reward_tensor (5120, response_len)
 
     Note over Driver,Actor: 阶段3: 计算旧策略对数概率
@@ -569,21 +569,21 @@ sequenceDiagram
     Driver->>Ref: compute_ref_log_prob(batch)
     Ref-->>Driver: ref_log_probs
 
-    Note over Driver: 阶段5: GRPO 优势计算 (Driver端)
+    Note over Driver: 阶段5: GRPO优势计算 (Driver端)
     Driver->>Driver: token_level_rewards = reward_tensor
-    Driver->>Driver: compute_grpo_outcome_advantage<br/>按 uuid 分组 → 组内归一化<br/>(R_i - μ) / (σ + ε)
-    Driver->>Driver: 得到 advantages, returns
+    Driver->>Driver: compute_grpo_outcome_advantage 按uid分组-组内归一化
+    Driver->>Driver: 得到advantages, returns
 
-    Note over Driver,Actor: 阶段6: 更新 Actor
+    Note over Driver,Actor: 阶段6: 更新Actor
     Driver->>Actor: update_actor(batch_with_advantages)
-    Actor->>Actor: PPO Clip Loss + KL Loss<br/>mini_batch=256*5=1280<br/>micro_batch=40/GPU
+    Actor->>Actor: PPO Clip Loss + KL Loss mini_batch=1280
     Actor-->>Driver: metrics (loss/grad_norm/mfu)
 
     Note over Driver,Ckpt: 阶段7: 权重同步
     Driver->>Ckpt: update_weights()
-    Ckpt->>Rollout: 同步更新后的 Actor 权重到 vLLM
+    Ckpt->>Rollout: 同步更新后的Actor权重到vLLM
 
-    Note over Driver: 记录 metrics → logger
+    Note over Driver: 记录metrics到logger
 ```
 
 #### D. GRPO 训练状态图（State Diagram）
@@ -592,46 +592,46 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> 初始化: ray.init + 加载配置
+    [*] --> Init: ray.init + load config
 
-    初始化 --> Worker创建: init_workers
-    Worker创建 --> 权重加载: load_checkpoint
-    权重加载 --> 等待训练: update_weights → Rollout
+    Init --> WorkerCreate: init_workers
+    WorkerCreate --> WeightLoad: load_checkpoint
+    WeightLoad --> WaitTrain: update_weights to Rollout
 
-    等待训练 --> Rollout生成: 采样 prompt batch
-    Rollout生成 --> Rollout休眠: sleep_replicas<br/>释放GPU显存
+    WaitTrain --> RolloutGen: sample prompt batch
+    RolloutGen --> RolloutSleep: sleep_replicas release GPU
 
-    Rollout休眠 --> 奖励计算: NaiveRewardManager
-    奖励计算 --> LogProb计算: Actor + Ref 前向
+    RolloutSleep --> RewardCalc: NaiveRewardManager
+    RewardCalc --> LogProbCalc: Actor + Ref forward
 
-    LogProb计算 --> 优势计算: GRPO 组内归一化
-    优势计算 --> Actor更新: PPO Clip + KL Loss
-    Actor更新 --> 权重同步: update_weights
+    LogProbCalc --> AdvCalc: GRPO group normalize
+    AdvCalc --> ActorUpdate: PPO Clip + KL Loss
+    ActorUpdate --> WeightSync: update_weights
 
-    权重同步 --> 验证检查: test_freq 周期
-    验证检查 --> 检查点保存: save_freq 周期
-    检查点保存 --> 等待训练: 下一个 step
+    WeightSync --> ValCheck: test_freq cycle
+    ValCheck --> CkptSave: save_freq cycle
+    CkptSave --> WaitTrain: next step
 
-    验证检查 --> 等待训练: 非验证步
-    权重同步 --> 等待训练: 非验证/保存步
+    ValCheck --> WaitTrain: non-val step
+    WeightSync --> WaitTrain: non-val/save step
 
-    等待训练 --> [*]: total_epochs 完成
+    WaitTrain --> [*]: total_epochs done
 
-    note right of Rollout生成
-        vLLM 推理
+    note right of RolloutGen
+        vLLM inference
         TP=2, n=5
-        每prompt生成5个响应
+        5 responses per prompt
     end note
 
-    note right of 优势计算
-        Driver端执行
+    note right of AdvCalc
+        Driver side
         scores = rewards.sum(-1)
-        按 uid 分组
-        A_i = (R_i - μ) / (σ + ε)
+        group by uid
+        A_i = (R_i - mu) / (sigma + eps)
     end note
 
-    note right of Actor更新
-        FSDP2 训练
+    note right of ActorUpdate
+        FSDP2 training
         param_offload=True
         optimizer_offload=True
         PPO Clip + KL Loss
