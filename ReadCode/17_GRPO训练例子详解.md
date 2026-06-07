@@ -432,6 +432,277 @@ A: verl 会自动保存，设置 `trainer.save_freq=5` 每 5 轮保存一次
 
 ---
 
+### 进阶：GRPO 训练深度流程解析
+
+以下图表基于 verl 源码（[ray_trainer.py](file:///workspace/verl/trainer/ppo/ray_trainer.py)、[core_algos.py](file:///workspace/verl/trainer/ppo/core_algos.py)、[main_ppo.py](file:///workspace/verl/trainer/main_ppo.py)）绘制，对应你运行的训练命令中的完整执行流程。
+
+#### A. GRPO 完整流程图（Flowchart）
+
+从 `main_ppo.py` 入口到 `ray_trainer.py` 的 `fit()` 训练循环，每一步的数据变换：
+
+```mermaid
+flowchart TD
+    START([python -m verl.trainer.main_ppo]) --> HYDRA[Hydra 加载配置<br/>ppo_trainer.yaml]
+    HYDRA --> RAY_INIT[ray.init 初始化集群]
+    RAY_INIT --> TASK_RUNNER[TaskRunner.run]
+    TASK_RUNNER --> SETUP[初始化阶段]
+    
+    SETUP --> LOAD_DATA[加载数据集<br/>RLDataset.from_parquet]
+    LOAD_DATA --> CREATE_TRAINER[创建 RayPPOTrainer]
+    CREATE_TRAINER --> INIT_WORKERS[init_workers<br/>创建 ActorRolloutRef / Critic Worker]
+    INIT_WORKERS --> LOAD_CKPT[_load_checkpoint<br/>加载检查点]
+    LOAD_CKPT --> UPDATE_WEIGHTS[checkpoint_manager.update_weights<br/>同步权重到 Rollout 引擎]
+
+    UPDATE_WEIGHTS --> FIT_START[fit 训练循环]
+    
+    subgraph 训练循环 [每个 Training Step]
+        FIT_START --> SAMPLE[DataLoader 采样 batch<br/>train_batch_size=1024 条 prompt]
+        SAMPLE --> ADD_UID[为每条数据分配 uuid<br/>用于 GRPO 分组]
+        ADD_UID --> REPEAT[batch.repeat n=5<br/>每条 prompt 复制 5 份]
+        REPEAT --> ROLLOUT[Rollout 生成响应<br/>vLLM 推理引擎<br/>TP=2, gpu_mem=0.3]
+        ROLLOUT --> SLEEP[checkpoint_manager.sleep_replicas<br/>释放 Rollout GPU 显存]
+        SLEEP --> UNION[batch = batch.union gen_output<br/>合并 prompt + response]
+        UNION --> REWARD[计算奖励<br/>NaiveRewardManager<br/>data_source→gsm8k.compute_score]
+        REWARD --> OLD_LOG[计算 old_log_prob<br/>Actor 前向推理]
+        OLD_LOG --> REF_LOG[计算 ref_log_prob<br/>Ref 策略前向推理]
+        REF_LOG --> ADV[compute_advantage<br/>GRPO 组内归一化]
+        ADV --> UPDATE_ACTOR[_update_actor<br/>PPO Clip + KL Loss]
+        UPDATE_ACTOR --> SAVE_CKPT{是否保存?}
+        SAVE_CKPT -->|是| DO_SAVE[_save_checkpoint]
+        SAVE_CKPT -->|否| UPDATE_W
+        DO_SAVE --> UPDATE_W[update_weights<br/>同步权重到 Rollout]
+        UPDATE_W --> LOG[记录 metrics<br/>rewards/entropy/KL/throughput]
+    end
+
+    LOG --> NEXT_STEP{还有 step?}
+    NEXT_STEP -->|是| SAMPLE
+    NEXT_STEP -->|否| DONE([训练完成])
+
+    style START fill:#e1f5fe
+    style ROLLOUT fill:#fff3e0
+    style REWARD fill:#ffebee
+    style ADV fill:#f3e5f5
+    style UPDATE_ACTOR fill:#e8f5e9
+    style DONE fill:#e8f5e9
+```
+
+#### B. GRPO 组件协作图（Collaboration Diagram）
+
+展示各 Worker 组件之间的协作关系和 GPU 资源分配：
+
+```mermaid
+graph TB
+    subgraph Driver进程 [Driver 进程 - RayPPOTrainer]
+        DRIVER[fit 训练循环<br/>compute_advantage<br/>metrics 收集]
+        DATALOADER[DataLoader<br/>GSM8K Parquet]
+        CKPT_MGR[CheckpointManager<br/>权重同步调度]
+    end
+
+    subgraph GPU_01_02 [GPU 0,1 - Rollout 引擎]
+        ROLLOUT[vLLM Rollout Worker<br/>TP=2<br/>gpu_memory_utilization=0.3]
+    end
+
+    subgraph GPU_0123 [GPU 0,1,2,3 - 训练引擎]
+        ACTOR[Actor Worker<br/>FSDP2 策略模型<br/>param_offload=True<br/>optimizer_offload=True]
+        REF[Ref Worker<br/>FSDP2 参考策略<br/>param_offload=True]
+    end
+
+    subgraph 奖励计算 [CPU 端 - 奖励函数]
+        REWARD_MGR[NaiveRewardManager<br/>逐条计算]
+        GSM8K[gsm8k.compute_score<br/>extract_solution + 评分]
+    end
+
+    DATALOADER -->|prompt batch| DRIVER
+    DRIVER -->|generate_sequences| ROLLOUT
+    ROLLOUT -->|responses + log_probs| DRIVER
+    DRIVER -->|compute_score| REWARD_MGR
+    REWARD_MGR -->|调用| GSM8K
+    GSM8K -->|reward_tensor| DRIVER
+    DRIVER -->|compute_log_prob| ACTOR
+    ACTOR -->|old_log_probs + entropy| DRIVER
+    DRIVER -->|compute_ref_log_prob| REF
+    REF -->|ref_log_probs| DRIVER
+    DRIVER -->|update_actor| ACTOR
+    CKPT_MGR -->|sleep/wake Rollout| ROLLOUT
+    CKPT_MGR -->|update_weights| ROLLOUT
+    ACTOR -->|训练后权重| CKPT_MGR
+
+    style DRIVER fill:#e1f5fe
+    style ROLLOUT fill:#fff3e0
+    style ACTOR fill:#e8f5e9
+    style REF fill:#f3e5f5
+    style GSM8K fill:#ffebee
+```
+
+#### C. GRPO 训练时序图（Sequence Diagram）
+
+展示单个 Training Step 中各组件的交互时序：
+
+```mermaid
+sequenceDiagram
+    participant DL as DataLoader
+    participant Driver as RayPPOTrainer<br/>(Driver)
+    participant Rollout as vLLM Rollout<br/>(GPU 0,1)
+    participant Reward as NaiveRewardManager
+    participant Actor as Actor Worker<br/>(GPU 0-3, FSDP2)
+    participant Ref as Ref Worker<br/>(GPU 0-3, FSDP2)
+    participant Ckpt as CheckpointManager
+
+    DL->>Driver: 采样 1024 条 prompt
+    Driver->>Driver: 分配 uuid, repeat(n=5)<br/>得到 5120 条数据
+
+    Note over Driver,Rollout: 阶段1: Rollout 生成
+    Driver->>Rollout: generate_sequences(5120条)
+    Rollout-->>Driver: 返回 responses + input_ids
+    Driver->>Ckpt: sleep_replicas() 释放Rollout显存
+
+    Note over Driver,Reward: 阶段2: 奖励计算
+    Driver->>Reward: compute_score(data_source, solution, ground_truth)
+    Reward->>Reward: data_source="openai/gsm8k"<br/>→ gsm8k.extract_solution<br/>→ gsm8k.compute_score
+    Reward-->>Driver: reward_tensor (5120, response_len)
+
+    Note over Driver,Actor: 阶段3: 计算旧策略对数概率
+    Driver->>Actor: compute_log_prob(batch)
+    Actor-->>Driver: old_log_probs + entropy
+
+    Note over Driver,Ref: 阶段4: 计算参考策略对数概率
+    Driver->>Ref: compute_ref_log_prob(batch)
+    Ref-->>Driver: ref_log_probs
+
+    Note over Driver: 阶段5: GRPO 优势计算 (Driver端)
+    Driver->>Driver: token_level_rewards = reward_tensor
+    Driver->>Driver: compute_grpo_outcome_advantage<br/>按 uuid 分组 → 组内归一化<br/>(R_i - μ) / (σ + ε)
+    Driver->>Driver: 得到 advantages, returns
+
+    Note over Driver,Actor: 阶段6: 更新 Actor
+    Driver->>Actor: update_actor(batch_with_advantages)
+    Actor->>Actor: PPO Clip Loss + KL Loss<br/>mini_batch=256*5=1280<br/>micro_batch=40/GPU
+    Actor-->>Driver: metrics (loss/grad_norm/mfu)
+
+    Note over Driver,Ckpt: 阶段7: 权重同步
+    Driver->>Ckpt: update_weights()
+    Ckpt->>Rollout: 同步更新后的 Actor 权重到 vLLM
+
+    Note over Driver: 记录 metrics → logger
+```
+
+#### D. GRPO 训练状态图（State Diagram）
+
+展示训练过程中系统的状态变迁：
+
+```mermaid
+stateDiagram-v2
+    [*] --> 初始化: ray.init + 加载配置
+
+    初始化 --> Worker创建: init_workers
+    Worker创建 --> 权重加载: load_checkpoint
+    权重加载 --> 等待训练: update_weights → Rollout
+
+    等待训练 --> Rollout生成: 采样 prompt batch
+    Rollout生成 --> Rollout休眠: sleep_replicas<br/>释放GPU显存
+
+    Rollout休眠 --> 奖励计算: NaiveRewardManager
+    奖励计算 --> LogProb计算: Actor + Ref 前向
+
+    LogProb计算 --> 优势计算: GRPO 组内归一化
+    优势计算 --> Actor更新: PPO Clip + KL Loss
+    Actor更新 --> 权重同步: update_weights
+
+    权重同步 --> 验证检查: test_freq 周期
+    验证检查 --> 检查点保存: save_freq 周期
+    检查点保存 --> 等待训练: 下一个 step
+
+    验证检查 --> 等待训练: 非验证步
+    权重同步 --> 等待训练: 非验证/保存步
+
+    等待训练 --> [*]: total_epochs 完成
+
+    note right of Rollout生成
+        vLLM 推理
+        TP=2, n=5
+        每prompt生成5个响应
+    end note
+
+    note right of 优势计算
+        Driver端执行
+        scores = rewards.sum(-1)
+        按 uid 分组
+        A_i = (R_i - μ) / (σ + ε)
+    end note
+
+    note right of Actor更新
+        FSDP2 训练
+        param_offload=True
+        optimizer_offload=True
+        PPO Clip + KL Loss
+    end note
+```
+
+#### E. GRPO 数据流图（Data Flow Diagram）
+
+展示数据在各阶段的变化，特别是张量形状的变换：
+
+```mermaid
+flowchart LR
+    subgraph 输入 [1. 数据输入]
+        A["Parquet 文件<br/>prompt / data_source<br/>reward_model / extra_info"]
+    end
+
+    subgraph 采样 [2. Prompt 采样]
+        B["batch: (1024,)<br/>每条含 prompt_ids<br/>+ uid + ground_truth"]
+    end
+
+    subgraph 重复 [3. Repeat n=5]
+        C["batch: (5120,)<br/>每条 prompt 复制5份<br/>uid 相同 → 同组"]
+    end
+
+    subgraph Rollout [4. Rollout 生成]
+        D["responses: (5120, 1024)<br/>attention_mask: (5120, 1536)<br/>rollout_log_probs: (5120, 1024)"]
+    end
+
+    subgraph 奖励 [5. 奖励计算]
+        E["reward_tensor: (5120, 1024)<br/>仅最后一个token非零<br/>1.0 或 0.0"]
+    end
+
+    subgraph LogProb [6. LogProb 计算]
+        F["old_log_probs: (5120, 1024)<br/>ref_log_probs: (5120, 1024)<br/>entropy: (5120, 1024)"]
+    end
+
+    subgraph 优势 [7. GRPO 优势]
+        G["advantages: (5120, 1024)<br/>returns: (5120, 1024)<br/>组内归一化结果"]
+    end
+
+    subgraph 更新 [8. Actor 更新]
+        H["PPO Clip Loss<br/>KL Loss<br/>梯度更新 Actor 权重"]
+    end
+
+    A --> B --> C --> D --> E --> F --> G --> H
+
+    style A fill:#e1f5fe
+    style D fill:#fff3e0
+    style E fill:#ffebee
+    style G fill:#f3e5f5
+    style H fill:#e8f5e9
+```
+
+#### F. 关键代码对应关系
+
+| 流程步骤 | 源码位置 | 关键函数/方法 |
+|---------|---------|-------------|
+| 入口 | [main_ppo.py:39](file:///workspace/verl/trainer/main_ppo.py#L39) | `@hydra.main → main(config)` |
+| 初始化 Worker | [main_ppo.py:312](file:///workspace/verl/trainer/main_ppo.py#L312) | `trainer.init_workers()` |
+| 训练循环 | [ray_trainer.py:1362](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1362) | `fit()` |
+| Prompt 采样+Repeat | [ray_trainer.py:1448](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1448) | `gen_batch.repeat(n=5, interleave=True)` |
+| Rollout 生成 | [ray_trainer.py:1470](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1470) | `async_rollout_manager.generate_sequences()` |
+| 奖励计算 | [ray_trainer.py:1525](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1525) | `extract_reward(batch)` → `NaiveRewardManager.__call__()` |
+| old_log_prob | [ray_trainer.py:1543](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1543) | `self._compute_old_log_prob(batch)` |
+| ref_log_prob | [ray_trainer.py:1579](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1579) | `self._compute_ref_log_prob(batch)` |
+| GRPO 优势计算 | [ray_trainer.py:1625](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1625) | `compute_advantage()` → `compute_grpo_outcome_advantage()` |
+| Actor 更新 | [ray_trainer.py:1649](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1649) | `self._update_actor(batch)` |
+| 权重同步 | [ray_trainer.py:1675](file:///workspace/verl/trainer/ppo/ray_trainer.py#L1675) | `checkpoint_manager.update_weights()` |
+
+---
+
 ### 进阶：从 GRPO 到 Dr.GRPO
 
 如果你想试试更先进的 Dr.GRPO（效果可能更好），只需改三个参数：
